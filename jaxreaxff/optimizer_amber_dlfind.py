@@ -14,8 +14,69 @@ jax.config.update("jax_enable_x64", True)
 import argparse
 from jaxreaxff.smartformatter import SmartFormatter
 
-from parmedmod import UpdateParmTopCLI
+from parmedmod import UpdateParmTopInMemory
 import os, re, glob, shutil
+
+def ConvertMultiPrimParamsForParmEd(params_dict):
+    """
+    Convert multi-primitive parameter format for ParmEd.
+
+    Input format (from optimizer):
+        {'9-10-11-12_p1': {'height': 1.0, 'phase': 0.0, 'periodicity': 1, ...},
+         '9-10-11-12_p2': {'height': 0.5, 'phase': 0.0, 'periodicity': 2, ...},
+         '9-10-11-12_p3': {'height': 0.3, 'phase': 0.0, 'periodicity': 3, ...}}
+
+    Output format (for ParmEd):
+        {'9-10-11-12': {'height': [1.0, 0.5, 0.3],
+                        'phase': [0.0, 0.0, 0.0],
+                        'periodicity': [1, 2, 3],
+                        'scee': 1.2, 'scnb': 2.0,
+                        'torsion_mask': [...]}}
+    """
+    grouped = {}
+
+    for key, value in params_dict.items():
+        # Extract base key (remove _pN suffix if present)
+        if '_p' in key:
+            base_key = key.split('_p')[0]
+            periodicity = int(key.split('_p')[1])
+        else:
+            # Single primitive (no suffix)
+            base_key = key
+            periodicity = value.get('periodicity', 1)
+
+        # Initialize base key if not seen
+        if base_key not in grouped:
+            grouped[base_key] = {
+                'height': [],
+                'phase': [],
+                'periodicity': [],
+                'scee': value.get('scee', 1.2),  # Scalar (same for all primitives)
+                'scnb': value.get('scnb', 2.0),  # Scalar (same for all primitives)
+                'torsion_mask': value.get('torsion_mask', [])  # Same for all primitives
+            }
+
+        # Append to lists (order by periodicity to ensure [1,2,3] not [2,1,3])
+        grouped[base_key]['height'].append(value['height'])
+        grouped[base_key]['phase'].append(value['phase'])
+        grouped[base_key]['periodicity'].append(value.get('periodicity', periodicity))
+
+    # Sort by periodicity for each torsion
+    for base_key in grouped:
+        # Zip together, sort by periodicity, unzip
+        combined = list(zip(
+            grouped[base_key]['periodicity'],
+            grouped[base_key]['height'],
+            grouped[base_key]['phase']
+        ))
+        combined.sort(key=lambda x: x[0])  # Sort by periodicity
+
+        periodicities, heights, phases = zip(*combined) if combined else ([], [], [])
+        grouped[base_key]['periodicity'] = list(periodicities)
+        grouped[base_key]['height'] = list(heights)
+        grouped[base_key]['phase'] = list(phases)
+
+    return grouped
 
 # make global array for loss
 losses = []
@@ -236,8 +297,57 @@ def min_inner(crds, target, energy_fn_no_restraint, energy_fn, init_fn, body_fn,
 
     return energies, post_positions, actual_torsions
 
+def compute_loss(residuals, loss_type='linear', delta=1.0):
+    """
+    Compute loss from residuals using different loss functions.
+
+    Parameters:
+    -----------
+    residuals : jnp.array
+        Difference between reference and computed energies
+    loss_type : str
+        Loss function type: 'linear' (SSE), 'huber', 'soft_l1', 'cauchy', 'arctan'
+    delta : float
+        Scaling parameter for robust loss functions (default=1.0)
+
+    Returns:
+    --------
+    loss : float
+        Computed loss value
+    """
+    if loss_type == 'linear':
+        # Standard sum of squared errors
+        return jnp.sum(residuals ** 2)
+
+    elif loss_type == 'huber':
+        # Huber loss: quadratic for small errors, linear for large errors
+        # Robust to outliers
+        abs_residuals = jnp.abs(residuals)
+        quadratic = jnp.where(abs_residuals <= delta,
+                              0.5 * residuals ** 2,
+                              0.0)
+        linear = jnp.where(abs_residuals > delta,
+                          delta * (abs_residuals - 0.5 * delta),
+                          0.0)
+        return jnp.sum(quadratic + linear)
+
+    elif loss_type == 'soft_l1':
+        # Soft L1 loss: smooth approximation of L1 loss
+        return jnp.sum(2 * delta**2 * (jnp.sqrt(1 + (residuals / delta)**2) - 1))
+
+    elif loss_type == 'cauchy':
+        # Cauchy loss: very robust to outliers
+        return jnp.sum(delta**2 * jnp.log(1 + (residuals / delta)**2))
+
+    elif loss_type == 'arctan':
+        # Arctan loss: bounded loss function
+        return jnp.sum(delta**2 * jnp.arctan((residuals / delta)**2))
+
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
+
 def gradObj(scipy_params, *args):
-    crds, boxVectors, ref_ene, post_positions, prms_pre, torsions = args
+    crds, boxVectors, ref_ene, post_positions, prms_pre, torsions, loss_type, loss_delta = args
 
     prms = prms_pre
 
@@ -272,10 +382,10 @@ def gradObj(scipy_params, *args):
     np_relative_ene_list=jnp.array(relative_ene_list)
     np_ref_ene=jnp.array(ref_ene)
 
-    difference=np_ref_ene-np_relative_ene_list
-    nrg_diff_sqrd = jnp.sum(difference ** 2)
+    residuals = np_ref_ene - np_relative_ene_list
+    loss = compute_loss(residuals, loss_type=loss_type, delta=loss_delta)
 
-    return nrg_diff_sqrd, relative_ene_list
+    return loss, relative_ene_list
 
 # updates amber prmtop file, runs constrained optimizations, computes difference between ref and computed energy profiles and RMSD.
 def ObjectiveFunction(scipy_params, *args):
@@ -283,45 +393,22 @@ def ObjectiveFunction(scipy_params, *args):
     iteration = iteration + 1
     print("Iteration:", iteration)
 
-    crds, boxVectors, ref_ene, params_dict, optvars_dict, prms, torsions, min_steps, outdir, prmtop_dir, min_interval, crd_flist, geo_dir, amber_dir = args
+    crds, boxVectors, ref_ene, params_dict, optvars_dict, prms, torsions, min_steps, outdir, prmtop_dir, min_interval, crd_flist, geo_dir, amber_dir, loss_type, loss_delta, param_to_optimizer_idx = args
 
     print("Updated Parameters:", scipy_params)
 
-    # set new parameters
-    i=0
+    # Set new parameters - ONLY heights (phases/scee/scnb are fixed)
+    # Use param_to_optimizer_idx mapping for coupling
     for key, value in params_dict.items():
-        if(optvars_dict['height']):
-            value['height']=scipy_params[i]
-            i+=1
+        optimizer_idx = param_to_optimizer_idx[key]
+        value['height'] = scipy_params[optimizer_idx]
 
-        if(optvars_dict['phase']):
-            value['phase']=scipy_params[i]
-            i+=1
-
-        if(optvars_dict['periodicity']):
-            value['periodicity']=scipy_params[i]
-            i+=1
-
-        if(optvars_dict['scee']):
-            value['scee']=scipy_params[i]
-            i+=1
-
-        if(optvars_dict['scnb']):
-            value['scnb']=scipy_params[i]
-            i+=1
-
-    # UpdateParmTopCLI(prmtop_dir, params_dict)
-
-    # update parmtop file with new parameters
-    #dh_dir='./confs_999-999/dh_7-9-10-11/'
-    UpdateParmTopCLI(prmtop_dir, params_dict)
-
-    i = 0
-    for idx in torsions[:, 4]:
-        prms._prmtop._raw_data['DIHEDRAL_FORCE_CONSTANT'][idx] = scipy_params[i]
-        prms._prmtop._raw_data['SCEE_SCALE_FACTOR'][idx] = scipy_params[i+1]
-        prms._prmtop._raw_data['SCNB_SCALE_FACTOR'][idx] = scipy_params[i+2]
-        i = i + 3
+    # Update parmtop file in memory with new parameters
+    # Convert multi-primitive format (separate _p1, _p2, _p3 keys) to grouped format
+    params_dict_grouped = ConvertMultiPrimParamsForParmEd(params_dict)
+    prmtop = UpdateParmTopInMemory(prmtop_dir, params_dict_grouped)
+    # Save updated prmtop to disk
+    prmtop.save(prmtop_dir, overwrite=True)
 
     # ene_list, post_positions = constrained_minimization_vec(crds, prms, boxVectors, min_steps, torsions, min_interval)
 
@@ -366,7 +453,7 @@ def ObjectiveFunction(scipy_params, *args):
     #TODO make sure you compare amber energies and the ones generated by this
 
     loss_and_grad_fn = jax.value_and_grad(gradObj, has_aux=True)
-    loss_and_grad = loss_and_grad_fn(scipy_params, crds, boxVectors, ref_ene, post_positions, prms, torsions)
+    loss_and_grad = loss_and_grad_fn(scipy_params, crds, boxVectors, ref_ene, post_positions, prms, torsions, loss_type, loss_delta)
 
     #global iteration
     #iteration = iteration + 1
@@ -429,57 +516,728 @@ def ObjectiveFunction(scipy_params, *args):
     #sys.exit()
     return loss, list(grad)
 
-def ff_opt(prmtop_dir, params_dir, geo_dir, amber_dir, min_steps, opt_loops, ref_ene, outdir, min_interval):
+def GetLinearGuess(params_dict_single, ref_ene, conf_lbl, dh_lbl, nprim, torsion_coupling_mode='semi-independent', geo_dir=None, prmtop_dir=None):
+    """
+    Get linear least-squares initial guess (FFPOpt-style) for multi-primitive heights.
+
+    NEW ADVANCED ALGORITHM (mirrors SciPy BuildLinearGuessScript):
+    1. Compute actual dihedral angles from XYZ geometries
+    2. Compute low-level energies (MM WITHOUT torsions being fitted)
+    3. Fit against TRUE torsion contribution: residual = ref_ene - llenes
+    4. Support torsion coupling (fully-independent, semi-independent, fully-coupled)
+    5. Use pseudoinverse with constant term for robust solving
+
+    Returns multi-primitive params dict with optimized heights.
+    """
+    import numpy as np
+    import os, glob
+    from openmm import app
+
+    print("\n" + "="*60)
+    print("LINEAR LEAST-SQUARES INITIAL GUESS (FFPOpt-style)")
+    print("="*60)
+
+    # Convert reference energies to numpy
+    ref_ene_array = np.array(ref_ene, dtype=float)
+    npoints = len(ref_ene_array)
+
+    # Check if we have geometries and prmtop for advanced algorithm
+    use_advanced = geo_dir is not None and prmtop_dir is not None
+
+    if not use_advanced:
+        print("  Using simple algorithm (no geometry dir provided)")
+        print(f"  Assuming uniform torsion scan: {npoints} points")
+
+        # Simple algorithm: assume uniform scan from 0 to 360 degrees
+        angles = np.linspace(0, 2*np.pi, npoints, endpoint=False)
+
+        # Build design matrix for multi-primitive fit
+        # E(θ) = Σ V_n/2 * (1 + cos(n*θ))  for n=1,2,3,...
+        # Note: AMBER uses V_n/2, not V_n
+        X = np.zeros((npoints, nprim))
+        for i in range(nprim):
+            n = i + 1  # periodicity 1, 2, 3, ...
+            X[:, i] = 0.5 * (1.0 + np.cos(n * angles))
+
+        # Solve linear system: X @ heights = ref_ene
+        heights, residuals, rank, s = np.linalg.lstsq(X, ref_ene_array, rcond=None)
+
+        # Compute RMSD
+        fitted_ene = X @ heights
+        rmsd = np.sqrt(np.mean((ref_ene_array - fitted_ene)**2))
+
+        print(f"  nprim={nprim}, npoints={npoints}")
+        print(f"  RMSD: {rmsd:.4f} kcal/mol")
+
+        # Create multi-primitive params dict
+        multi_prim_dict = {}
+        for torsion_key, params in params_dict_single.items():
+            for i in range(nprim):
+                n = i + 1
+                new_key = f"{torsion_key}_p{n}"
+                # Allow negative heights (physical in multi-primitive fits)
+                multi_prim_dict[new_key] = {
+                    'height': float(heights[i]),
+                    'phase': 0.0,
+                    'periodicity': n,
+                    'scee': params.get('scee', 1.2),
+                    'scnb': params.get('scnb', 2.0),
+                    'torsion_mask': params.get('torsion_mask', [])
+                }
+                print(f"    {new_key}: height={heights[i]:.4f}, phase=0.0°, periodicity={n}")
+
+        return multi_prim_dict
+
+    # ADVANCED ALGORITHM: Use actual geometries and compute low-level energies
+    print("  Using advanced algorithm (with geometry analysis)")
+    print(f"  Loaded {npoints} reference energies")
+
+    # Load XYZ files
+    xyz_pattern = os.path.join(geo_dir, '*.xyz')
+    xyz_files = sorted(glob.glob(xyz_pattern))
+
+    if len(xyz_files) != npoints:
+        print(f"  Warning: Found {len(xyz_files)} geometries but {npoints} energies")
+        print(f"  Trimming to {min(len(xyz_files), npoints)} points")
+        trim_to = min(len(xyz_files), npoints)
+        xyz_files = xyz_files[:trim_to]
+        ref_ene_array = ref_ene_array[:trim_to]
+        npoints = trim_to
+
+    # Parse atom names from prmtop
+    def parse_atom_names(prmtop_path):
+        names = []
+        with open(prmtop_path, 'r') as fh:
+            reading = False
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith('%FLAG ATOM_NAME'):
+                    reading = True
+                    continue
+                if not reading:
+                    continue
+                if stripped.startswith('%FLAG ') and not stripped.startswith('%FLAG ATOM_NAME'):
+                    break
+                if stripped.startswith('%FORMAT'):
+                    continue
+                if not stripped:
+                    continue
+                for i in range(0, len(line), 4):
+                    token = line[i:i+4].strip()
+                    if token:
+                        names.append(token)
+        return names
+
+    atom_names = parse_atom_names(prmtop_dir)
+    print(f"  Loaded {len(atom_names)} atoms from prmtop")
+
+    # Load XYZ coordinates
+    def load_xyz(path):
+        with open(path, 'r') as fh:
+            lines = fh.readlines()
+        natoms = int(lines[0].split()[0])
+        coords = []
+        for line in lines[2:2+natoms]:
+            parts = line.split()
+            if len(parts) >= 4:
+                coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+        return np.array(coords, dtype=float)
+
+    coords_stack = [load_xyz(path) for path in xyz_files]
+    natoms = coords_stack[0].shape[0]
+    print(f"  Loaded {len(coords_stack)} conformers ({natoms} atoms each)")
+
+    # Compute dihedral angles from geometries
+    def compute_dihedral(coords, idx_tuple):
+        p0, p1, p2, p3 = (coords[i] for i in idx_tuple)
+        b0 = p0 - p1
+        b1 = p2 - p1
+        b2 = p3 - p2
+        norm_b1 = np.linalg.norm(b1)
+        if norm_b1 == 0.0:
+            return 0.0
+        b1_unit = b1 / norm_b1
+        v = b0 - np.dot(b0, b1_unit) * b1_unit
+        w = b2 - np.dot(b2, b1_unit) * b1_unit
+        x = np.dot(v, w)
+        y = np.dot(np.cross(b1_unit, v), w)
+        return np.degrees(np.arctan2(y, x))
+
+    # Get torsion indices
+    torsion_order = list(params_dict_single.keys())
+    torsion_indices = {}
+    torsion_angles = {}
+
+    for torsion_key in torsion_order:
+        mask = params_dict_single[torsion_key].get('torsion_mask', [])
+        if len(mask) != 4:
+            raise ValueError(f'Torsion {torsion_key} has invalid torsion_mask: {mask}')
+        indices = []
+        for atom_name in mask:
+            if atom_name not in atom_names:
+                raise ValueError(f'Atom name {atom_name} not found in prmtop for torsion {torsion_key}')
+            indices.append(atom_names.index(atom_name))
+        torsion_indices[torsion_key] = tuple(indices)
+
+        # Compute angles for this torsion across all conformers
+        angle_list = [compute_dihedral(coords, torsion_indices[torsion_key]) for coords in coords_stack]
+        torsion_angles[torsion_key] = np.array(angle_list, dtype=float)
+        print(f'    {torsion_key}: angle span {np.min(angle_list):.2f}° to {np.max(angle_list):.2f}° (range {np.ptp(angle_list):.2f}°)')
+
+    # Compute low-level energies (MM WITHOUT torsions being fitted)
+    # This is the FFPOpt approach: isolates TRUE torsion contribution
+    print("\n" + "="*60)
+    print("COMPUTING LOW-LEVEL ENERGIES (MM without torsions)")
+    print("="*60)
+
+    # Create prmtop without torsions being fitted
+    from parmedmod import CreatePrmtopWithoutTorsions
+
+    all_torsion_masks = [params_dict_single[key]['torsion_mask'] for key in torsion_order]
+    prmtop_no_torsion = prmtop_dir + '_no_torsion'
+
+    print(f"  Creating temporary prmtop with {len(torsion_order)} torsion(s) deleted...")
+    CreatePrmtopWithoutTorsions(prmtop_dir, prmtop_no_torsion, all_torsion_masks, debug=False)
+    print(f"  Created: {prmtop_no_torsion}")
+
+    # Compute energies using OpenMM
+    print(f"\n  Running OpenMM single-point energies for {npoints} geometries...")
+
+    # Load prmtop without torsions
+    prmtop_no_tors = app.AmberPrmtopFile(prmtop_no_torsion)
+    system_no_tors = prmtop_no_tors.createSystem(
+        nonbondedMethod=app.NoCutoff,
+        constraints=None
+    )
+
+    # Create integrator and context (for energy evaluation only)
+    integrator_no_tors = openmm.LangevinIntegrator(300*unit.kelvin, 1.0/unit.picosecond, 0.002*unit.picosecond)
+    context_no_tors = openmm.Context(system_no_tors, integrator_no_tors)
+
+    llenes = []
+    for i, coords in enumerate(coords_stack):
+        # Set positions (coords are in Angstroms, OpenMM uses nanometers)
+        positions = coords * 0.1  # Angstrom to nm
+        context_no_tors.setPositions(positions)
+
+        # Get potential energy
+        state = context_no_tors.getState(getEnergy=True)
+        energy_kj = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+        energy_kcal = energy_kj * 0.239006  # kJ/mol to kcal/mol
+
+        llenes.append(energy_kcal)
+        if (i + 1) % 5 == 0 or (i + 1) == npoints:
+            print(f'    Geometry {i+1}/{npoints}: llene = {energy_kcal:.6f} kcal/mol')
+
+    del context_no_tors
+    del integrator_no_tors
+    llenes = np.array(llenes, dtype=float)
+
+    # Clean up temporary prmtop
+    os.remove(prmtop_no_torsion)
+
+    # Shift both llenes and ref_ene to zero minimum (FFPOpt approach)
+    llenes -= np.min(llenes)
+    ref_ene_shifted = ref_ene_array - np.min(ref_ene_array)
+
+    # Compute TRUE torsion contribution: residual = ref_ene - llenes
+    residual = ref_ene_shifted - llenes
+
+    print(f"\n  Low-level energies computed successfully")
+    print(f"    llenes range: {np.min(llenes):.6f} to {np.max(llenes):.6f} kcal/mol")
+    print(f"    ref_ene range: {np.min(ref_ene_shifted):.6f} to {np.max(ref_ene_shifted):.6f} kcal/mol")
+    print(f"    Torsion contribution range: {np.min(residual):.6f} to {np.max(residual):.6f} kcal/mol")
+
+    # Build torsion groups based on coupling mode
+    if coupling_mode == 'fully-coupled':
+        torsion_groups = [torsion_order]
+    elif coupling_mode == 'fully-independent':
+        torsion_groups = [[key] for key in torsion_order]
+    else:  # semi-independent
+        pattern_groups = {}
+        for key in torsion_order:
+            pattern = tuple(params_dict_single[key].get('torsion_mask', []))
+            pattern_groups.setdefault(pattern, []).append(key)
+        torsion_groups = list(pattern_groups.values())
+
+    # Initialize with GAFF fallback
+    linear_params = {}
+    for torsion_key in torsion_order:
+        torsion_vals = params_dict_single[torsion_key]
+        height_val = torsion_vals.get('height', 0.0)
+        scee_val = torsion_vals.get('scee', 1.2)
+        scnb_val = torsion_vals.get('scnb', 2.0)
+        fallback_heights = [float(height_val)] + [0.0] * (nprim - 1)
+        linear_params[torsion_key] = {
+            'height': fallback_heights,
+            'phase': [0.0] * nprim,
+            'periodicity': list(range(1, nprim + 1)),
+            'scee': scee_val,
+            'scnb': scnb_val,
+            'torsion_mask': torsion_vals.get('torsion_mask', [])
+        }
+
+    print("\n" + "="*60)
+    print("MULTI-PRIMITIVE PARAMETERS (LINEAR LSQ)")
+    print("="*60)
+
+    # Fit each group
+    for group in torsion_groups:
+        if not group:
+            continue
+
+        # Build design matrix for this group
+        group_columns = []
+        for torsion_key in group:
+            ang_rad = np.deg2rad(torsion_angles[torsion_key])
+            for harmonic in range(1, nprim + 1):
+                # AMBER convention: E = V_n/2 * (1 + cos(n*phi - gamma))
+                # With phase=0: E = V_n/2 * (1 + cos(n*phi))
+                group_columns.append(0.5 * (1.0 + np.cos(harmonic * ang_rad)))
+
+        # Add constant term column (absorbs baseline offset)
+        design_matrix = np.column_stack(group_columns + [np.ones(npoints)])
+        target = residual.copy()
+
+        # Use pseudoinverse for robust solving (more stable than lstsq)
+        coeffs_with_const = np.linalg.pinv(design_matrix).dot(target)
+
+        # Extract constant term
+        const = coeffs_with_const[-1]
+        coeffs = coeffs_with_const[:-1]  # Torsion heights (V_n parameters)
+
+        # Compute fit quality
+        fit = design_matrix[:, :-1].dot(coeffs) + const
+        ss_res = float(np.sum((target - fit) ** 2))
+        ss_tot = float(np.sum((target - np.mean(target)) ** 2))
+        rmse = float(np.sqrt(np.mean((target - fit) ** 2)))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+        if r2 < 0.0:
+            print(f"  Warning: group {group} produced poor fit (RMSE={rmse:.4f}, R2={r2:.4f}); using GAFF fallback")
+            continue
+
+        # Update residual
+        residual -= fit
+
+        # Extract heights for each torsion in group
+        coeff_index = 0
+        for torsion_key in group:
+            heights = []
+            for _ in range(nprim):
+                heights.append(float(coeffs[coeff_index]))
+                coeff_index += 1
+
+            torsion_vals = params_dict_single[torsion_key]
+            scee_val = torsion_vals.get('scee', 1.2)
+            scnb_val = torsion_vals.get('scnb', 2.0)
+
+            linear_params[torsion_key] = {
+                'height': heights,
+                'phase': [0.0] * nprim,
+                'periodicity': list(range(1, nprim + 1)),
+                'scee': scee_val,
+                'scnb': scnb_val,
+                'torsion_mask': torsion_vals.get('torsion_mask', [])
+            }
+
+            heights_fmt = ', '.join('%.4f' % h for h in heights)
+            print(f'    {torsion_key}: heights=[{heights_fmt}] (RMSE={rmse:.4f}, R2={r2:.4f})')
+
+    # Convert to JAX format (separate _pN entries)
+    multi_prim_dict = {}
+    for torsion_key, params in linear_params.items():
+        for i in range(nprim):
+            n = i + 1
+            new_key = f"{torsion_key}_p{n}"
+            multi_prim_dict[new_key] = {
+                'height': params['height'][i],  # Allow negative (physical in multi-prim)
+                'phase': params['phase'][i],
+                'periodicity': params['periodicity'][i],
+                'scee': params['scee'],
+                'scnb': params['scnb'],
+                'torsion_mask': params['torsion_mask']
+            }
+
+    print("\nLinear guess generation complete!")
+    return multi_prim_dict
+
+def GetFourierGuess(params_dict_single, ref_ene):
+    """
+    Get Fourier-based initial guess for single-primitive parameters.
+
+    Returns single-primitive params dict with Fourier-derived height and phase.
+    """
+    import numpy as np
+
+    ref_ene_array = np.array(ref_ene, dtype=float)
+    N = len(ref_ene_array)
+    angles = np.linspace(0, 2*np.pi, N, endpoint=False)
+    mean_ene = np.mean(ref_ene_array)
+
+    # Multi-harmonic Fourier fit
+    max_harmonics = 3
+
+    # Build design matrix
+    X = np.ones((len(angles), 1))  # c0 term
+    for n in range(1, max_harmonics + 1):
+        X = np.column_stack([X, np.cos(n * angles), np.sin(n * angles)])
+
+    # Solve linear system
+    coeffs, residuals, rank, s = np.linalg.lstsq(X, ref_ene_array, rcond=None)
+
+    # Reconstruct and compute R2
+    reconstruction = X @ coeffs
+    ss_res = np.sum((ref_ene_array - reconstruction)**2)
+    ss_tot = np.sum((ref_ene_array - mean_ene)**2)
+    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+    rmse = np.sqrt(ss_res / len(ref_ene_array))
+
+    print(f"\nFourier-based initial guess:")
+    print(f"  R²: {r2:.4f}, RMSE: {rmse:.4f} kcal/mol")
+
+    # Extract harmonics
+    harmonics = []
+    for i in range(max_harmonics):
+        a_n = coeffs[1 + 2*i]
+        b_n = coeffs[1 + 2*i + 1]
+        A = np.sqrt(a_n**2 + b_n**2)
+        phi = np.arctan2(b_n, a_n)
+        harmonics.append((i+1, A, phi))
+        print(f"    n={i+1}: A={A:.4f}, phi={np.degrees(phi):7.1f}°")
+
+    # Select best harmonic (prefer n=2 or n=3)
+    max_amplitude = max(h[1] for h in harmonics)
+    threshold = 0.8 * max_amplitude
+
+    preferred = [(n, A, phi) for n, A, phi in harmonics if n in [2, 3] and A >= threshold]
+    if preferred:
+        periodicity_0, A_0, phi_0 = max(preferred, key=lambda x: x[1])
+    else:
+        periodicity_0, A_0, phi_0 = max(harmonics, key=lambda x: x[1])
+
+    # Wrap phase to [0°, 180°]
+    phi_0_deg = np.degrees(phi_0) % 180.0
+
+    print(f"  Selected: n={periodicity_0}, A={A_0:.4f}, phase={phi_0_deg:.1f}°")
+
+    # Create single-primitive guess with Fourier height and phase
+    fourier_params = {}
+    for torsion_key, params in params_dict_single.items():
+        fourier_params[torsion_key] = params.copy()
+        fourier_params[torsion_key]['height'] = A_0
+        fourier_params[torsion_key]['phase'] = phi_0_deg
+
+    return fourier_params
+
+def GetStandardGuess(params_dict_single):
+    """
+    Get standard GAFF initial guess (use params as-is).
+    """
+    print("\nUsing standard GAFF initial guess from params.json")
+    return params_dict_single.copy()
+
+def ConvertToMultiPrimitive(params_dict, nprim=3, phase_strategy='fixed_zero'):
+    """
+    Convert single-primitive torsion parameters to multi-primitive.
+
+    Takes a dictionary with single torsion entries like:
+        {'7-9-10-11': {'height': 2.5, 'phase': 180.0, 'periodicity': 2, ...}}
+
+    Returns a dictionary with multiple periodicities:
+        {'7-9-10-11_p1': {'height': h1, 'phase': 0.0, 'periodicity': 1, ...},
+         '7-9-10-11_p2': {'height': h2, 'phase': 0.0, 'periodicity': 2, ...},
+         '7-9-10-11_p3': {'height': h3, 'phase': 0.0, 'periodicity': 3, ...}}
+
+    Parameters:
+    -----------
+    params_dict : dict
+        Single-primitive parameters
+    nprim : int
+        Number of primitives (3 or 6)
+    phase_strategy : str
+        'fixed_zero' or 'alternating'
+    """
+    multi_prim_dict = {}
+
+    # Define phases based on strategy
+    if phase_strategy == 'fixed_zero':
+        phases = [0.0] * nprim
+    elif phase_strategy == 'alternating':
+        phases = [0.0, 180.0, 0.0, 180.0, 0.0, 0.0][:nprim]
+    else:
+        raise ValueError(f"Unknown phase_strategy: {phase_strategy}")
+
+    # Define periodicities
+    periodicities = list(range(1, nprim + 1))
+
+    for torsion_key, params in params_dict.items():
+        # Get initial height from single primitive
+        initial_height = params.get('height', 1.0)
+
+        # Create nprim entries for this torsion
+        for i, (periodicity, phase) in enumerate(zip(periodicities, phases), start=1):
+            new_key = f"{torsion_key}_p{periodicity}"
+            multi_prim_dict[new_key] = {
+                'height': initial_height / nprim,  # Distribute initial height
+                'phase': phase,
+                'periodicity': periodicity,
+                'scee': params.get('scee', 1.2),  # Keep original scaling
+                'scnb': params.get('scnb', 2.0),
+                'torsion_mask': params.get('torsion_mask', [])  # Preserve torsion_mask
+            }
+
+    return multi_prim_dict
+
+def GroupTorsionsByAtomType(params_dict, prmtop_file):
+    """
+    Group torsions by their atom type pattern.
+
+    This allows semi-independent fitting where torsions with the same atom type
+    pattern (e.g., c3-c3-c3-c3) share parameters, but different patterns
+    (e.g., c3-c3-c3-hc) have independent parameters.
+
+    Args:
+        params_dict: Dictionary of torsion parameters with 'torsion_mask' for each
+        prmtop_file: Path to prmtop file to extract atom types
+
+    Returns:
+        dict: {type_pattern: [torsion_key1, torsion_key2, ...]}
+              type_pattern is like 'c3-c3-c3-c3'
+    """
+    import parmed as pmd
+
+    # Load prmtop to get atom types
+    try:
+        parm = pmd.load_file(prmtop_file)
+    except Exception as e:
+        print(f"Warning: Could not load prmtop file '{prmtop_file}': {e}")
+        print("  Falling back to fully-coupled mode (all torsions in one group)")
+        # Return all torsions in a single group if we can't load prmtop
+        return {'unknown-type': list(params_dict.keys())}
+
+    # Build mapping from atom name to atom type
+    name_to_type = {atom.name: atom.type for atom in parm.atoms}
+
+    # Group torsions by atom type pattern
+    type_groups = {}
+
+    for torsion_key, torsion_data in params_dict.items():
+        # For multi-primitive keys like "7-9-10-11_p1", extract base key
+        base_key = torsion_key.split('_p')[0] if '_p' in torsion_key else torsion_key
+
+        # Get atom names for this torsion
+        atom_names = torsion_data.get('torsion_mask', [])
+
+        if len(atom_names) != 4:
+            print(f"Warning: Torsion {torsion_key} has invalid torsion_mask: {atom_names}")
+            continue
+
+        # Get atom types for these names
+        try:
+            atom_types = [name_to_type[name] for name in atom_names]
+            type_pattern = '-'.join(atom_types)
+        except KeyError as e:
+            print(f"Warning: Atom name {e} not found in prmtop for torsion {torsion_key}")
+            continue
+
+        # Add to group
+        if type_pattern not in type_groups:
+            type_groups[type_pattern] = []
+        type_groups[type_pattern].append(torsion_key)
+
+    return type_groups
+
+def ff_opt(prmtop_dir, params_dir, geo_dir, amber_dir, min_steps, opt_loops, ref_ene, outdir, min_interval, nprim=3, multi_prim_phase_strategy='fixed_zero', initial_guess_method='linear', auto_nprim_fallback=True, nprim_fallback_threshold=1.0, loss='huber', loss_delta=1.0, torsion_coupling_mode='semi-independent'):
+    """
+    Force field optimization using JAX with multi-primitive strategy.
+
+    Parameters:
+    -----------
+    nprim : int, default=3
+        Number of primitives (periodicities) to use:
+        - nprim=1: Single primitive (original behavior, not recommended)
+        - nprim=3: Multi-primitive with [1,2,3] periodicities (like ffpopt)
+        - nprim=6: Extended multi-primitive with [1,2,3,4,5,6] periodicities
+
+    multi_prim_phase_strategy : str, default='fixed_zero'
+        How to handle phases in multi-primitive mode:
+        - 'fixed_zero': Fix all phases to 0° (like ffpopt) - RECOMMENDED
+        - 'alternating': Alternate between 0° and 180° for periodicities [1,2,3,4,5,6]
+
+    initial_guess_method : str, default='linear'
+        Method for generating initial guess:
+        - 'linear': Linear LSQ guess (FFPOpt-style) - RECOMMENDED for multi-primitive
+        - 'fourier': Fourier-based guess (good for complex profiles)
+        - 'gaff': Standard GAFF guess from params.json
+
+    auto_nprim_fallback : bool, default=True
+        Automatically fallback to nprim=6 if nprim=3 doesn't achieve good fit.
+        If True and best loss corresponds to RMSD > nprim_fallback_threshold,
+        retry with nprim=6.
+
+    nprim_fallback_threshold : float, default=0.5
+        RMSD threshold (kcal/mol) that triggers automatic fallback to nprim=6.
+        Only used if auto_nprim_fallback=True and nprim=3.
+
+    loss : str, default='huber'
+        Loss function type:
+        - 'linear': Sum of squared errors (SSE) - standard but sensitive to outliers
+        - 'huber': Huber loss - robust to outliers (RECOMMENDED)
+        - 'soft_l1': Soft L1 loss - smooth approximation of L1
+        - 'cauchy': Cauchy loss - very robust to outliers
+        - 'arctan': Arctan loss - bounded loss function
+
+    loss_delta : float, default=1.0
+        Scaling parameter for robust loss functions (used in huber, soft_l1, cauchy, arctan).
+        Controls transition point between quadratic and linear behavior.
+
+    torsion_coupling_mode : str, default='semi-independent'
+        How to couple torsions across the molecule:
+        - 'semi-independent': Group torsions by atom-type pattern (RECOMMENDED, default)
+        - 'fully-independent': Each torsion has independent parameter set
+        - 'fully-coupled': Single parameter set shared by all torsions
+
+    Note: Only barrier heights are optimized. Phases are FIXED based on strategy.
+          scee and scnb scaling factors are NOT optimized (kept at default values).
+    """
+    # Declare global variables that track best optimization results
+    global best_loss, best_params, best_iteration, best_energy, losses, iteration
+
     initial_guess='initial_guess'
     algorithm='L-BFGS-B'
     # maxiter=1000
     step_size=0.100000
+
+    print("="*60)
+    print("JAX MULTI-PRIMITIVE TORSION OPTIMIZER")
+    print("="*60)
+    print(f"nprim                 : {nprim}")
+    print(f"phase_strategy        : {multi_prim_phase_strategy}")
+    print(f"initial_guess_method  : {initial_guess_method}")
+    print(f"loss_function         : {loss} (delta={loss_delta})")
+    print(f"torsion_coupling      : {torsion_coupling_mode}")
+    if auto_nprim_fallback and nprim == 3:
+        print(f"auto_nprim_fallback   : Enabled (threshold={nprim_fallback_threshold} kcal/mol)")
+    print("="*60)
 
     crd_flist=[geo_dir + '_%03d' % (i) + '.xyz' for i in range(NPOINTS)]
 
     #list of 36 (35,3) numpy arrays from 0-350 deg
     coordinates = extractCoordinates(crd_flist)
 
-    params_dict=ReadJsonData(params_dir)[initial_guess]
+    # Load single-primitive parameters
+    params_dict_single=ReadJsonData(params_dir)[initial_guess]
     optvars_dict=ReadJsonData(params_dir)['optvars']
     bounds_dict=ReadJsonData(params_dir)['bounds']
 
-    guess=list()
-    bounds=list()
+    # Load reference energies
+    ref_ene_data = ReadJsonData(ref_ene)['ref_ene']
+    conf_lbl_str = os.path.basename(os.path.dirname(geo_dir))
+    dh_lbl_str = os.path.basename(geo_dir)
 
-    for key, value in params_dict.items():
-        if(optvars_dict['height']):
+    # Select initial guess method
+    if initial_guess_method == 'linear':
+        # Linear LSQ directly generates multi-primitive parameters
+        print(f"\nUsing Linear LSQ initial guess (FFPOpt-style)")
+        params_dict = GetLinearGuess(params_dict_single, ref_ene_data, conf_lbl_str, dh_lbl_str, nprim,
+                                      torsion_coupling_mode=torsion_coupling_mode,
+                                      geo_dir=geo_dir, prmtop_dir=prmtop_dir)
+    elif initial_guess_method == 'fourier':
+        # Fourier generates single-primitive, then convert to multi-primitive
+        print(f"\nUsing Fourier initial guess")
+        params_dict_fourier = GetFourierGuess(params_dict_single, ref_ene_data)
+        if nprim > 1:
+            print(f"Converting Fourier guess to multi-primitive (nprim={nprim})")
+            params_dict = ConvertToMultiPrimitive(params_dict_fourier, nprim=nprim, phase_strategy=multi_prim_phase_strategy)
+        else:
+            params_dict = params_dict_fourier
+    elif initial_guess_method == 'gaff':
+        # Standard GAFF, then convert to multi-primitive
+        print(f"\nUsing standard GAFF initial guess")
+        params_dict_gaff = GetStandardGuess(params_dict_single)
+        if nprim > 1:
+            print(f"Converting GAFF guess to multi-primitive (nprim={nprim})")
+            params_dict = ConvertToMultiPrimitive(params_dict_gaff, nprim=nprim, phase_strategy=multi_prim_phase_strategy)
+        else:
+            params_dict = params_dict_gaff
+    else:
+        raise ValueError(f"Unknown initial_guess_method: {initial_guess_method}")
+
+    # Build initial guess and bounds based on coupling mode - ONLY for heights
+    guess = list()
+    bounds = list()
+
+    # Create mapping from parameter to optimizer index for coupling
+    param_to_optimizer_idx = {}  # Maps each torsion key to its optimizer index
+
+    if torsion_coupling_mode == 'fully-independent':
+        # FULLY INDEPENDENT: Each torsion has its own parameters
+        print(f"\nBuilding guess/bounds for FULLY-INDEPENDENT mode ({len(params_dict)} parameters)")
+        for idx, (key, value) in enumerate(params_dict.items()):
             guess.append(value['height'])
             bounds.append(bounds_dict['height'])
+            param_to_optimizer_idx[key] = idx
 
-        if(optvars_dict['phase']):
-            guess.append(value['phase'])
-            bounds.append(bounds_dict['phase'])
+    elif torsion_coupling_mode == 'semi-independent':
+        # SEMI-INDEPENDENT: Group by atom type pattern, share within group
+        type_groups = GroupTorsionsByAtomType(params_dict, prmtop_dir)
+        print(f"\nBuilding guess/bounds for SEMI-INDEPENDENT mode ({len(type_groups)} atom type groups)")
 
-        if(optvars_dict['periodicity']):
-            guess.append(value['periodicity'])
-            bounds.append(bounds_dict['periodicity'])
+        idx = 0
+        for type_pattern, torsion_keys in type_groups.items():
+            print(f"  Group '{type_pattern}': {len(torsion_keys)} torsions")
+            # Use first torsion in group as representative
+            representative_key = torsion_keys[0]
+            guess.append(params_dict[representative_key]['height'])
+            bounds.append(bounds_dict['height'])
 
-        if(optvars_dict['scee']):
-            guess.append(value['scee'])
-            bounds.append(bounds_dict['scee'])
+            # Map all torsions in this group to same optimizer index
+            for torsion_key in torsion_keys:
+                param_to_optimizer_idx[torsion_key] = idx
+            idx += 1
 
-        if(optvars_dict['scnb']):
-            guess.append(value['scnb'])
-            bounds.append(bounds_dict['scnb'])
+    elif torsion_coupling_mode == 'fully-coupled':
+        # FULLY COUPLED: All torsions share the same parameters
+        print(f"\nBuilding guess/bounds for FULLY-COUPLED mode (1 parameter set for {len(params_dict)} torsions)")
+        # Use first torsion as representative
+        first_key = list(params_dict.keys())[0]
+        guess.append(params_dict[first_key]['height'])
+        bounds.append(bounds_dict['height'])
 
-    # Make initial FF modifications using parmed
+        # Map all torsions to index 0
+        for key in params_dict.keys():
+            param_to_optimizer_idx[key] = 0
+    else:
+        raise ValueError(f"Unknown torsion_coupling_mode: {torsion_coupling_mode}")
+
+    print(f"Number of parameters to optimize: {len(guess)} (heights only)")
+    print(f"Initial guess: {guess}")
+
+    # Make initial FF modifications using parmed in-memory
     rng = np.random.default_rng()
     for k in params_dict:
         params_dict[k]['height'] += rng.random() # * 1e-5 too small of a value and parmed will truncate it, adjust this if you'd like
-    UpdateParmTopCLI(prmtop_dir, params_dict)
+    # Convert multi-primitive format to grouped format for ParmEd
+    params_dict_grouped_initial = ConvertMultiPrimParamsForParmEd(params_dict)
+    prmtop_initial = UpdateParmTopInMemory(prmtop_dir, params_dict_grouped_initial)
+    prmtop_initial.save(prmtop_dir, overwrite=True)
 
     prmtopomm = app.AmberPrmtopFile(prmtop_dir)
 
     # Grab all indices of torsions from the params file
-    torsions = [list(map(int, torsion.split("-"))) for torsion in params_dict.keys()]
+    # For multi-primitive, keys are like "7-9-10-11_p1", "7-9-10-11_p2", etc.
+    # Extract unique base torsions (remove _pN suffix)
+    unique_torsions = set()
+    for key in params_dict.keys():
+        # Remove _pN suffix if present
+        base_key = key.split('_p')[0] if '_p' in key else key
+        unique_torsions.add(base_key)
+
+    torsions = [list(map(int, torsion.split("-"))) for torsion in unique_torsions]
     ref_ene = jnp.array(ReadJsonData(ref_ene)['ref_ene'])
     print("Torsion Indices from parameter file:", torsions)
+    print(f"Number of unique torsions: {len(torsions)}, Number of parameter entries: {len(params_dict)}")
 
     # Use regular numpy to prevent tracing to make this easier
     torsionidx = prmtopomm._prmtop._raw_data["DIHEDRALS_INC_HYDROGEN"] + prmtopomm._prmtop._raw_data["DIHEDRALS_WITHOUT_HYDROGEN"]
@@ -511,8 +1269,8 @@ def ff_opt(prmtop_dir, params_dir, geo_dir, amber_dir, min_steps, opt_loops, ref
     boxVectors = jnp.array([100.0, 100.0, 100.0])
 
     minimization_result=minimize(ObjectiveFunction, guess, jac=True, \
-           args=(coordinates, boxVectors, ref_ene, params_dict, optvars_dict, prmtopomm, torsion_indices, 
-                 min_steps, outdir, prmtop_dir, min_interval, crd_flist, geo_dir, amber_dir), \
+           args=(coordinates, boxVectors, ref_ene, params_dict, optvars_dict, prmtopomm, torsion_indices,
+                 min_steps, outdir, prmtop_dir, min_interval, crd_flist, geo_dir, amber_dir, loss, loss_delta, param_to_optimizer_idx), \
            bounds=bounds, method=algorithm, options={'maxiter':opt_loops, 'eps': step_size})
 
     print("Losses:", losses)
@@ -529,30 +1287,133 @@ def ff_opt(prmtop_dir, params_dir, geo_dir, amber_dir, min_steps, opt_loops, ref
 
     print("Termination Message: ", minimization_result.message)
 
+    # Check if auto-fallback to 6 primitives is needed
+    if auto_nprim_fallback and nprim == 3:
+        # Store initial nprim result (from global variables)
+        initial_nprim = nprim
+        best_loss_3prim = float(best_loss)
+        best_params_3prim = best_params.copy() if best_params is not None else None
+        best_energy_3prim = best_energy.copy() if best_energy is not None else None
+        best_iteration_3prim = int(best_iteration)
+
+        # Compute RMSD from best loss (SSE)
+        ref_ene_array = jnp.array(ref_ene_data)
+        best_rmsd_3prim = jnp.sqrt(best_loss_3prim / len(ref_ene_array))
+
+        print("\n" + "="*60)
+        print("AUTO-FALLBACK CHECK (nprim=3 → nprim=6)")
+        print("="*60)
+        print(f"Best RMSD with 3 primitives: {best_rmsd_3prim:.6f} kcal/mol")
+        print(f"Threshold for fallback     : {nprim_fallback_threshold:.6f} kcal/mol")
+
+        if best_rmsd_3prim > nprim_fallback_threshold:
+            print(f"\n→ RMSD exceeds threshold, falling back to 6 primitives")
+            print("="*60)
+
+            # Reset global trackers for 6-prim optimization
+            best_loss = jnp.iinfo(jnp.int64).max
+            best_params = None
+            best_iteration = -1
+            best_energy = None
+            losses = []
+            iteration = 0
+
+            print("\nRegenerating initial guess with 6 primitives...")
+
+            # Regenerate guess with nprim=6
+            if initial_guess_method == 'linear':
+                params_dict_6prim = GetLinearGuess(params_dict_single, ref_ene_data, conf_lbl_str, dh_lbl_str, 6,
+                                                    torsion_coupling_mode=torsion_coupling_mode,
+                                                    geo_dir=geo_dir, prmtop_dir=prmtop_dir)
+            elif initial_guess_method == 'fourier':
+                params_dict_fourier_6 = GetFourierGuess(params_dict_single, ref_ene_data)
+                params_dict_6prim = ConvertToMultiPrimitive(params_dict_fourier_6, nprim=6, phase_strategy=multi_prim_phase_strategy)
+            elif initial_guess_method == 'gaff':
+                params_dict_gaff_6 = GetStandardGuess(params_dict_single)
+                params_dict_6prim = ConvertToMultiPrimitive(params_dict_gaff_6, nprim=6, phase_strategy=multi_prim_phase_strategy)
+
+            # Build new guess and bounds for 6 primitives with coupling
+            guess_6prim = []
+            bounds_6prim = []
+            param_to_optimizer_idx_6prim = {}
+
+            if torsion_coupling_mode == 'fully-independent':
+                for idx, (key, value) in enumerate(params_dict_6prim.items()):
+                    guess_6prim.append(value['height'])
+                    bounds_6prim.append(bounds_dict['height'])
+                    param_to_optimizer_idx_6prim[key] = idx
+
+            elif torsion_coupling_mode == 'semi-independent':
+                type_groups_6prim = GroupTorsionsByAtomType(params_dict_6prim, prmtop_dir)
+                idx = 0
+                for type_pattern, torsion_keys in type_groups_6prim.items():
+                    representative_key = torsion_keys[0]
+                    guess_6prim.append(params_dict_6prim[representative_key]['height'])
+                    bounds_6prim.append(bounds_dict['height'])
+                    for torsion_key in torsion_keys:
+                        param_to_optimizer_idx_6prim[torsion_key] = idx
+                    idx += 1
+
+            elif torsion_coupling_mode == 'fully-coupled':
+                first_key = list(params_dict_6prim.keys())[0]
+                guess_6prim.append(params_dict_6prim[first_key]['height'])
+                bounds_6prim.append(bounds_dict['height'])
+                for key in params_dict_6prim.keys():
+                    param_to_optimizer_idx_6prim[key] = 0
+
+            print(f"\nStarting optimization with 6 primitives...")
+            print(f"Number of parameters: {len(guess_6prim)}")
+
+            # Update prmtop with 6-prim initial guess
+            # Convert multi-primitive format to grouped format for ParmEd
+            params_dict_6prim_grouped = ConvertMultiPrimParamsForParmEd(params_dict_6prim)
+            prmtop_6prim_initial = UpdateParmTopInMemory(prmtop_dir, params_dict_6prim_grouped)
+            prmtop_6prim_initial.save(prmtop_dir, overwrite=True)
+
+            # Re-run optimization with 6 primitives
+            minimization_result_6prim = minimize(ObjectiveFunction, guess_6prim, jac=True, \
+                   args=(coordinates, boxVectors, ref_ene, params_dict_6prim, optvars_dict, prmtopomm, torsion_indices,
+                         min_steps, outdir, prmtop_dir, min_interval, crd_flist, geo_dir, amber_dir, loss, loss_delta, param_to_optimizer_idx_6prim), \
+                   bounds=bounds_6prim, method=algorithm, options={'maxiter':opt_loops, 'eps': step_size})
+
+            # Compare results
+            best_rmsd_6prim = jnp.sqrt(best_loss / len(ref_ene_array))
+
+            print("\n" + "="*60)
+            print("FALLBACK RESULTS COMPARISON")
+            print("="*60)
+            print(f"Best RMSD with 3 primitives: {best_rmsd_3prim:.6f} kcal/mol")
+            print(f"Best RMSD with 6 primitives: {best_rmsd_6prim:.6f} kcal/mol")
+
+            if best_rmsd_6prim < best_rmsd_3prim:
+                improvement = ((best_rmsd_3prim - best_rmsd_6prim) / best_rmsd_3prim) * 100
+                print(f"\n✓ 6-primitive fit IMPROVED by {improvement:.1f}%")
+                print(f"  Keeping 6-primitive result (nprim=6)")
+                # Use 6-prim results
+                params_dict = params_dict_6prim
+                minimization_result = minimization_result_6prim
+                nprim = 6
+            else:
+                print(f"\n✗ 6-primitive fit did NOT improve")
+                print(f"  Reverting to 3-primitive result (nprim=3)")
+                # Restore 3-prim results
+                best_loss = best_loss_3prim
+                best_params = best_params_3prim
+                best_energy = best_energy_3prim
+                best_iteration = best_iteration_3prim
+                # params_dict already has 3-prim version
+            print("="*60)
+        else:
+            print(f"\n✓ RMSD within threshold, keeping 3 primitives")
+            print("="*60)
+
     x = minimization_result.x
 
-    # Set final parameters in dictionary and save
+    # Set final parameters in dictionary and save - ONLY heights
     i=0
     for key, value in params_dict.items():
-        if(optvars_dict['height']):
-            value['height']=x[i]
-            i+=1
-
-        if(optvars_dict['phase']):
-            value['phase']=x[i]
-            i+=1
-
-        if(optvars_dict['periodicity']):
-            value['periodicity']=x[i]
-            i+=1
-
-        if(optvars_dict['scee']):
-            value['scee']=x[i]
-            i+=1
-
-        if(optvars_dict['scnb']):
-            value['scnb']=x[i]
-            i+=1
+        value['height']=x[i]
+        i+=1
 
     # SaveJsonData(params_dict, outdir + '/final_params.json')
 
@@ -607,10 +1468,46 @@ def main():
       type=int,
       default=5,
       help='Number of parameter optimization iterations between geometry optimization')
+    parser.add_argument('--nprim', metavar='primitives',
+      type=int,
+      default=3,
+      help='Number of primitives (periodicities): 1=single, 3=multi-primitive [1,2,3], 6=extended [1,2,3,4,5,6]')
+    parser.add_argument('--phase_strategy', metavar='strategy',
+      type=str,
+      default='fixed_zero',
+      choices=['fixed_zero', 'alternating'],
+      help='Phase strategy for multi-primitive: fixed_zero (all 0°) or alternating (0°/180°)')
+    parser.add_argument('--initial_guess', metavar='method',
+      type=str,
+      default='linear',
+      choices=['linear', 'fourier', 'gaff'],
+      help='Initial guess method: linear (LSQ/FFPOpt), fourier (Fourier analysis), gaff (standard GAFF)')
+    parser.add_argument('--auto_fallback', metavar='bool',
+      type=lambda x: x.lower() in ['true', '1', 'yes'],
+      default=True,
+      help='Enable automatic fallback to nprim=6 if nprim=3 fails (default: True)')
+    parser.add_argument('--fallback_threshold', metavar='threshold',
+      type=float,
+      default=0.5,
+      help='RMSD threshold (kcal/mol) for triggering fallback to nprim=6 (default: 0.5)')
+    parser.add_argument('--loss', metavar='function',
+      type=str,
+      default='huber',
+      choices=['linear', 'huber', 'soft_l1', 'cauchy', 'arctan'],
+      help='Loss function: linear (SSE), huber (robust), soft_l1, cauchy, arctan (default: huber)')
+    parser.add_argument('--loss_delta', metavar='delta',
+      type=float,
+      default=1.0,
+      help='Scaling parameter for robust loss functions (default: 1.0)')
+    parser.add_argument('--coupling', metavar='mode',
+      type=str,
+      default='semi-independent',
+      choices=['fully-independent', 'semi-independent', 'fully-coupled'],
+      help='Torsion coupling mode: semi-independent (RECOMMENDED), fully-independent, fully-coupled (default: semi-independent)')
 
     args = parser.parse_args()
 
-    ff_opt(args.prmtop, args.params, args.geo, args.amber_dir, args.minsteps, args.maxiter, args.reference, args.out, args.mininterval)
+    ff_opt(args.prmtop, args.params, args.geo, args.amber_dir, args.minsteps, args.maxiter, args.reference, args.out, args.mininterval, args.nprim, args.phase_strategy, args.initial_guess, args.auto_fallback, args.fallback_threshold, args.loss, args.loss_delta, args.coupling)
 
 if __name__ == "__main__":
     main()
